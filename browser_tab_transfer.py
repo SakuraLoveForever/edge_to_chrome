@@ -64,7 +64,7 @@ BROWSERS = {
             r"C:\Program Files\Mozilla Firefox\firefox.exe",
             r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
         ],
-        "user_data": os.path.expandvars(r"%APPDATA%\Mozilla\Firefox\Profiles"),
+        "user_data": os.path.expandvars(r"%APPDATA%\Mozilla\Firefox"),
         "new_tab": "-new-tab",
     },
 }
@@ -92,26 +92,56 @@ def is_running(k):
 
 
 def find_firefox_profile():
-    d = BROWSERS["firefox"]["user_data"]
-    ini = os.path.join(d, "profiles.ini")
+    base = BROWSERS["firefox"]["user_data"]
+    ini = os.path.join(base, "profiles.ini")
     if not os.path.isfile(ini):
-        return None
+        # Fallback: try old location inside Profiles subdirectory
+        ini = os.path.join(base, "Profiles", "profiles.ini")
+        if not os.path.isfile(ini):
+            return None
+
     cfg = configparser.ConfigParser()
     cfg.read(ini)
+
+    # Method 1: Install section — Default is a profile path (FF 67+)
     for sec in cfg.sections():
         if sec.startswith("Install"):
             dk = cfg[sec].get("Default")
-            if dk and dk in cfg:
-                pp = cfg[dk].get("Path", "")
+            if dk:
+                if not os.path.isabs(dk):
+                    # Paths in profiles.ini are relative to the Firefox config dir
+                    dk = os.path.join(base, dk)
+                if os.path.isdir(dk):
+                    return dk
+
+    # Method 2: Iterate profile sections to find the one marked Default=1
+    for sec in cfg.sections():
+        if sec.startswith("Profile"):
+            if cfg[sec].get("Default") == "1" or cfg[sec].getboolean("Default", fallback=False):
+                pp = cfg[sec].get("Path", "")
                 if pp:
                     if not os.path.isabs(pp):
-                        pp = os.path.join(d, pp)
+                        pp = os.path.join(base, pp)
                     if os.path.isdir(pp):
                         return pp
-    for item in os.listdir(d):
-        full = os.path.join(d, item)
-        if os.path.isdir(full) and (".default-release" in item or ".default" in item):
-            return full
+    # If no Default=1, return the first profile found
+    for sec in cfg.sections():
+        if sec.startswith("Profile"):
+            pp = cfg[sec].get("Path", "")
+            if pp:
+                if not os.path.isabs(pp):
+                    pp = os.path.join(base, pp)
+                if os.path.isdir(pp):
+                    return pp
+
+    # Method 3: Search for profile directories by naming convention
+    profiles_dir = os.path.join(base, "Profiles")
+    if os.path.isdir(profiles_dir):
+        for item in os.listdir(profiles_dir):
+            full = os.path.join(profiles_dir, item)
+            if os.path.isdir(full) and (".default-release" in item or ".default" in item):
+                return full
+
     return None
 
 
@@ -171,26 +201,72 @@ def _send_combo(mod_vk, key_vk):
     if not HAS_WIN32:
         return
     win32api.keybd_event(mod_vk, 0, 0, 0)
-    time.sleep(0.03)
-    win32api.keybd_event(key_vk, 0, 0, 0)
-    time.sleep(0.06)
-    win32api.keybd_event(key_vk, 0, win32con.KEYEVENTF_KEYUP, 0)
     time.sleep(0.02)
-    win32api.keybd_event(mod_vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+    win32api.keybd_event(key_vk, 0, 0, 0)
     time.sleep(0.04)
+    win32api.keybd_event(key_vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+    time.sleep(0.01)
+    win32api.keybd_event(mod_vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+    time.sleep(0.02)
+
+
+def _force_foreground(hwnd):
+    """Bring window to foreground — tries multiple strategies for Edge/Chrome."""
+    if not HAS_WIN32:
+        return False
+    cur = win32gui.GetForegroundWindow()
+    if cur == hwnd:
+        return True
+
+    # Restore if minimized
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        time.sleep(0.05)
+
+    # Strategy 1: Alt key to acquire foreground rights, then SetForegroundWindow
+    ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)  # Alt down
+    time.sleep(0.02)
+    ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)  # Alt up
+    time.sleep(0.03)
+    ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)  # ASFW_ANY
+    win32gui.SetForegroundWindow(hwnd)
+    time.sleep(0.10)
+    if win32gui.GetForegroundWindow() == hwnd:
+        return True
+
+    # Strategy 2: SwitchToThisWindow (undocumented, more aggressive)
+    ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
+    time.sleep(0.12)
+    if win32gui.GetForegroundWindow() == hwnd:
+        return True
+
+    # Strategy 3: AttachThreadInput + SetForegroundWindow
+    cur_tid, _ = win32process.GetWindowThreadProcessId(cur)
+    tgt_tid, _ = win32process.GetWindowThreadProcessId(hwnd)
+    if cur_tid != tgt_tid:
+        try:
+            ctypes.windll.user32.AttachThreadInput(cur_tid, tgt_tid, 1)
+            win32gui.SetForegroundWindow(hwnd)
+            ctypes.windll.user32.AttachThreadInput(cur_tid, tgt_tid, 0)
+            time.sleep(0.10)
+        except Exception:
+            pass
+
+    return win32gui.GetForegroundWindow() == hwnd
 
 
 def _read_address_bar(hwnd):
     """Focus browser window, send Ctrl+L → Ctrl+C, return clipboard URL."""
     if not HAS_WIN32:
         return ''
-    cur = win32gui.GetForegroundWindow()
-    if cur != hwnd:
+
+    if not _force_foreground(hwnd):
+        # Last resort: try to at least make it visible
         try:
-            win32gui.SetForegroundWindow(hwnd)
-        except:
+            ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
+            time.sleep(0.15)
+        except Exception:
             pass
-        time.sleep(0.15)
 
     # Clear clipboard
     try:
@@ -199,29 +275,35 @@ def _read_address_bar(hwnd):
         win32clipboard.CloseClipboard()
     except:
         pass
-    time.sleep(0.06)
+    time.sleep(0.03)
 
     _send_combo(_VK_CTRL, _VK_L)   # focus address bar
-    time.sleep(0.12)
+    time.sleep(0.08)
     _send_combo(_VK_CTRL, _VK_C)   # copy
-    time.sleep(0.10)
+    time.sleep(0.06)
 
     url = ''
-    try:
-        win32clipboard.OpenClipboard()
+    for _ in range(2):  # retry once if empty
         try:
-            url = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT) or ''
+            win32clipboard.OpenClipboard()
+            try:
+                url = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT) or ''
+            except:
+                pass
+            win32clipboard.CloseClipboard()
         except:
             pass
-        win32clipboard.CloseClipboard()
-    except:
-        pass
+        if url.strip():
+            break
+        time.sleep(0.08)
+        _send_combo(_VK_CTRL, _VK_C)
+
     return url.strip()
 
 
 def _next_tab():
     _send_combo(_VK_CTRL, _VK_TAB)
-    time.sleep(0.45)
+    time.sleep(0.30)
 
 
 def _prev_tab():
@@ -230,18 +312,18 @@ def _prev_tab():
     win32api.keybd_event(_VK_CTRL, 0, 0, 0)
     time.sleep(0.02)
     win32api.keybd_event(_VK_SHIFT, 0, 0, 0)
-    time.sleep(0.02)
+    time.sleep(0.01)
     win32api.keybd_event(_VK_TAB, 0, 0, 0)
-    time.sleep(0.06)
+    time.sleep(0.04)
     win32api.keybd_event(_VK_TAB, 0, win32con.KEYEVENTF_KEYUP, 0)
-    time.sleep(0.02)
+    time.sleep(0.01)
     win32api.keybd_event(_VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0)
-    time.sleep(0.02)
+    time.sleep(0.01)
     win32api.keybd_event(_VK_CTRL, 0, win32con.KEYEVENTF_KEYUP, 0)
-    time.sleep(0.45)
+    time.sleep(0.30)
 
 
-def get_chromium_tabs(key, log=None):
+def get_chromium_tabs(key, log=None, on_progress=None):
     """Read ALL open tab URLs from Chrome/Edge by cycling through tabs
     and reading the address bar via Ctrl+L / Ctrl+C.  Returns list of {url, title}.
 
@@ -274,6 +356,8 @@ def get_chromium_tabs(key, log=None):
         if start_url and start_url.lower().startswith('http'):
             seen_urls.add(start_url.lower().rstrip('/'))
             all_tabs.append({"url": start_url, "title": ""})
+            if on_progress:
+                on_progress(len(all_tabs))
         elif start_url:
             seen_urls.add(start_url.lower())
 
@@ -298,6 +382,8 @@ def get_chromium_tabs(key, log=None):
             if url.lower().startswith('http'):
                 seen_urls.add(key_u)
                 all_tabs.append({"url": url, "title": ""})
+                if on_progress:
+                    on_progress(len(all_tabs))
                 if log:
                     log(f"    标签 {i+1}: {url[:80]}")
             else:
@@ -394,7 +480,7 @@ def mozlz4_decompress(data):
     return lz4.block.decompress(data[12:], uncompressed_size=size)
 
 
-def get_firefox_tabs(log=None):
+def get_firefox_tabs(log=None, on_progress=None):
     """Read open tabs from Firefox — NO browser restart needed."""
     if not HAS_LZ4:
         if log:
@@ -444,6 +530,8 @@ def get_firefox_tabs(log=None):
                 title = entry.get("title", "")
                 if url and not url.startswith(("about:", "moz-extension://", "about:blank")):
                     tabs.append({"url": url, "title": title})
+                    if on_progress:
+                        on_progress(len(tabs))
         return tabs
     except Exception as e:
         if log:
@@ -453,7 +541,7 @@ def get_firefox_tabs(log=None):
 
 # ── Open tabs in target browser ─────────────────────────────────
 
-def open_tabs(target, tabs, log=None):
+def open_tabs(target, tabs, log=None, on_progress=None):
     import subprocess
     exe = find_exe(target)
     flag = BROWSERS[target]["new_tab"]
@@ -467,20 +555,126 @@ def open_tabs(target, tabs, log=None):
         return
 
     cnt = 0
-    for t in tabs:
+    total = len(tabs)
+    was_running = is_running(target)
+    for i, t in enumerate(tabs):
         try:
             subprocess.Popen(
                 [exe, flag, t["url"]],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             cnt += 1
-            time.sleep(0.06)
+            if on_progress:
+                on_progress(cnt, total)
+            # Cold start: browser needs time to initialise before first tab registers
+            if i == 0 and not was_running:
+                time.sleep(2.0)
+            else:
+                time.sleep(0.06)
         except Exception:
             import webbrowser
             webbrowser.open(t["url"])
             cnt += 1
     if log:
         log(f"  ✓ 已在 {BROWSERS[target]['label']} 打开 {cnt} 个标签页")
+
+
+# ── Status Popup ────────────────────────────────────────────────
+
+class StatusPopup:
+    """Compact sci-fi status overlay — topmost, click-through, auto-hides."""
+    BAR_W = 220
+
+    def __init__(self, root, src_label, dst_label):
+        self.root = root
+        self.win = tk.Toplevel(root)
+        self.win.overrideredirect(True)
+        self.win.attributes('-topmost', True)
+        self.win.attributes('-disabled', True)
+
+        self._bg = "#0c0c18"
+        self._fg = "#00e5ff"
+        self._dim = "#505080"
+
+        self.win.configure(bg=self._bg)
+
+        # Glow border — thin
+        border = tk.Frame(self.win, bg="#1a1a3e", padx=1, pady=1)
+        border.pack()
+        inner = tk.Frame(border, bg=self._bg, padx=14, pady=8)
+        inner.pack()
+
+        # Top row: icon + phase + count
+        top = tk.Frame(inner, bg=self._bg)
+        top.pack(fill="x")
+        self._icon_lbl = tk.Label(top, text="◉", font=("Consolas", 10),
+                                  fg=self._fg, bg=self._bg, width=2, anchor="w")
+        self._icon_lbl.pack(side="left")
+        self._status_lbl = tk.Label(top, text="READY", font=("Consolas", 10, "bold"),
+                                    fg=self._fg, bg=self._bg, anchor="w")
+        self._status_lbl.pack(side="left")
+        self._count_lbl = tk.Label(top, text="", font=("Consolas", 10, "bold"),
+                                   fg=self._fg, bg=self._bg)
+        self._count_lbl.pack(side="right")
+
+        # Progress bar
+        self._canvas = tk.Canvas(inner, width=self.BAR_W, height=2, bg=self._bg,
+                                 highlightthickness=0, bd=0)
+        self._canvas.pack(fill="x", pady=(6, 4))
+        self._bar_bg = self._canvas.create_rectangle(0, 0, self.BAR_W, 2,
+                                                     fill="#1a1a3e", outline="")
+        self._bar_id = self._canvas.create_rectangle(0, 0, 0, 2, fill=self._fg, outline="")
+
+        # Bottom: src → dst (tiny)
+        tk.Label(inner, text=f"{src_label}  →  {dst_label}",
+                font=("Consolas", 7), fg=self._dim, bg=self._bg).pack(anchor="e")
+
+        self._position()
+
+    def _position(self):
+        self.win.update_idletasks()
+        w = self.win.winfo_width()
+        h = self.win.winfo_height()
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        x = (sw - w) // 2
+        y = sh - h - 80
+        self.win.geometry(f"+{x}+{y}")
+
+    def update(self, status, count="", progress=None):
+        def _upd():
+            try:
+                if not self.win.winfo_exists():
+                    return
+                self._status_lbl.configure(text=status[:20])
+                if count:
+                    self._count_lbl.configure(text=count[:12])
+                if progress is not None:
+                    self._canvas.coords(self._bar_id, 0, 0,
+                                        int(self.BAR_W * max(0, min(1, progress))), 2)
+            except Exception:
+                pass
+        self.root.after(0, _upd)
+
+    def set_icon(self, char):
+        def _upd():
+            try:
+                if self.win.winfo_exists():
+                    self._icon_lbl.configure(text=char)
+            except Exception:
+                pass
+        self.root.after(0, _upd)
+
+    def destroy(self, callback=None):
+        def _d():
+            try:
+                if self.win.winfo_exists():
+                    self.win.destroy()
+            except Exception:
+                pass
+            if callback:
+                self.root.after(0, callback)
+        self.root.after(0, _d)
 
 
 # ── GUI ─────────────────────────────────────────────────────────
@@ -491,6 +685,7 @@ class App:
         self.root.title("浏览器标签页转移")
         self.root.resizable(False, False)
         self._busy = False
+        self._popup = None
 
         main = ttk.Frame(root, padding=(12, 8, 12, 8))
         main.pack(fill="both", expand=True)
@@ -533,6 +728,13 @@ class App:
         self._put("就绪 — 选择源/目标浏览器，一键转移")
         self._put("  直接读取浏览器会话文件，无需关闭浏览器")
 
+    def _clear_log(self):
+        def _w():
+            self.log.configure(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.configure(state="disabled")
+        self.root.after(0, _w)
+
     def _put(self, msg):
         def _w():
             self.log.configure(state="normal")
@@ -551,6 +753,14 @@ class App:
         self.root.after(0, lambda: self.btn.configure(
             state="normal", text="▶  一键转移"))
 
+    def _popup_update(self, status, count="", progress=None):
+        if self._popup:
+            self._popup.update(status, count, progress)
+
+    def _popup_icon(self, char):
+        if self._popup:
+            self._popup.set_icon(char)
+
     def _go(self):
         if self._busy:
             return
@@ -561,6 +771,10 @@ class App:
             return
 
         self._busy_on()
+        self._clear_log()
+        self._popup = StatusPopup(self.root,
+                                  BROWSERS[src]["label"],
+                                  BROWSERS[dst]["label"])
         self._put("─" * 35)
         self._put(f"  {BROWSERS[src]['label']}  →  {BROWSERS[dst]['label']}")
         threading.Thread(target=self._worker, args=(src, dst), daemon=True).start()
@@ -568,33 +782,58 @@ class App:
     def _worker(self, src, dst):
         try:
             tag = BROWSERS[src]["label"]
+            dst_tag = BROWSERS[dst]["label"]
 
             # ── Step 1: Read tabs ──
             self._put("")
             self._put(f"▸ 读取 {tag} 当前打开的标签页 ...")
 
+            self._popup_update("CAPTURING", "0", 0.05)
+            self._popup_icon("◉")
+
+            def _on_read(n):
+                self._popup_update("CAPTURING", str(n), 0.05 + min(n / 40, 0.30))
+
             if src == "firefox":
-                tabs = get_firefox_tabs(log=self._put)
+                self._popup_icon("◈")
+                tabs = get_firefox_tabs(log=self._put, on_progress=_on_read)
             else:
-                tabs = get_chromium_tabs(src, log=self._put)
+                tabs = get_chromium_tabs(src, log=self._put, on_progress=_on_read)
 
             if not tabs:
+                self._popup_update("NO TABS", "0", 0.0)
+                self._popup_icon("✗")
+                time.sleep(1.2)
                 self._put(f"  ⚠ 未找到标签页。请确认 {tag} 正在运行并有打开的页面。")
                 return
 
-            self._put(f"  共提取 {len(tabs)} 个标签页")
+            n = len(tabs)
+            self._put(f"  共提取 {n} 个标签页")
+            self._popup_update("DONE", str(n), 0.35)
+            self._popup_icon("✓")
 
             # Show preview
             for i, t in enumerate(tabs[:15], 1):
                 label = t['title'] if t['title'] else t['url']
                 self._put(f"  {i:2d}. {label[:60]}")
-            if len(tabs) > 15:
-                self._put(f"  ... 及另外 {len(tabs) - 15} 个")
+            if n > 15:
+                self._put(f"  ... 及另外 {n - 15} 个")
 
             # ── Step 2: Open in target ──
             self._put("")
-            self._put(f"▸ 在 {BROWSERS[dst]['label']} 中打开 ...")
-            open_tabs(dst, tabs, log=self._put)
+            self._put(f"▸ 在 {dst_tag} 中打开 ...")
+            self._popup_update("DEPLOYING", f"0/{n}", 0.40)
+            self._popup_icon("▷")
+
+            def _on_open(cnt, total):
+                p = 0.40 + (cnt / total) * 0.55
+                self._popup_update("DEPLOYING", f"{cnt}/{total}", p)
+
+            open_tabs(dst, tabs, log=self._put, on_progress=_on_open)
+
+            self._popup_update("COMPLETE", f"{n}/{n}", 1.0)
+            self._popup_icon("●")
+            time.sleep(1.5)
 
             self._put("")
             self._put("✓ 完成")
@@ -603,7 +842,13 @@ class App:
             self._put(f"✗ {e}")
             import traceback
             self._put(traceback.format_exc())
+            self._popup_update("ERROR", "0", 0.0)
+            self._popup_icon("✗")
+            time.sleep(2.0)
         finally:
+            if self._popup:
+                self._popup.destroy()
+                self._popup = None
             self._busy_off()
 
 
